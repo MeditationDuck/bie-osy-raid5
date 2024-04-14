@@ -179,14 +179,11 @@ class CRaidVolume
             int endingSector = (secNr + secCnt) / (m_Dev.m_Devices - 1) + config_size;
             int endingDisk = (secNr + secCnt) % (m_Dev.m_Devices - 1);
             int row_size = endingSector - startingSector + 1;
-    
 
             char** buffers = new char*[m_Dev.m_Devices];
             for (int i = 0; i < m_Dev.m_Devices; i++) {
                 buffers[i] = new char[SECTOR_SIZE * row_size];
             }
-            
-            // take data from disks.
             for(int j = 0; j < m_Dev.m_Devices; j++){
                 int ret = m_Dev.m_Read(j, startingSector, buffers[j], row_size);
                 if(ret != row_size){
@@ -194,51 +191,6 @@ class CRaidVolume
                     degraded_disk = j;
                 }
             }
-
-            // only there was error then check parity. and if necessary, fix disk.
-            if(m_status == RAID_DEGRADED){
-                for(int i = 0; i < row_size; i++){
-                    int parity_disk = parityDisk(startingSector + i);
-                    char* parity_xor = new char[SECTOR_SIZE];
-                    memset(parity_xor, 0, SECTOR_SIZE);
-
-                    for(int j = 0; j < m_Dev.m_Devices; j++){
-                        if(j == parity_disk){
-                            continue;
-                        }else{
-                            for(int k = 0; k < SECTOR_SIZE; k++){
-                                parity_xor[k] ^= buffers[j][i* SECTOR_SIZE + k];
-                            }
-                        }
-                    }
-
-                    if(memcmp(parity_xor, buffers[parity_disk] + i*SECTOR_SIZE , SECTOR_SIZE) != 0) {
-                        // unmatch data.
-                        if(m_status == RAID_DEGRADED){
-                            
-                            memset(buffers[degraded_disk] + i*SECTOR_SIZE, 0, SECTOR_SIZE);
-                            for(int j = 0; j < m_Dev.m_Devices; j++){
-                                if(degraded_disk == i) continue;
-                                
-                                for(int k = 0; k < SECTOR_SIZE; k++){
-                                    buffers[degraded_disk][i*SECTOR_SIZE + k] ^= buffers[j][i*SECTOR_SIZE + k];
-                                }
-                            }
-
-                            // complete replace buffers.
-                        } else if(m_status == RAID_FAILED){
-                            for (int d = 0; d < m_Dev.m_Devices; d++) {
-                                delete[] buffers[d];
-                            }
-                            delete[] buffers;
-                            delete[] parity_xor;
-                            return false;
-                        }
-                    }
-                    delete [] parity_xor;
-                }
-            }
-
             int data_index = 0;
             char* dataPtr = static_cast<char*>(data);
 
@@ -251,7 +203,6 @@ class CRaidVolume
                     data_index++;
                 }
             }
-
             for(int d = 0; d < m_Dev.m_Devices; d++){
                 delete[] buffers[d];
             }
@@ -477,7 +428,7 @@ void                                   test1                                   (
 
     for ( int i = 0; i < vol.size(); i++ )
     {
-        printf("%d\n");
+        // printf("%d\n", i);
         char buffer [SECTOR_SIZE];
         assert ( vol . read ( i, buffer, 1 ) );
         assert ( vol . write ( i, buffer, 1 ) );
