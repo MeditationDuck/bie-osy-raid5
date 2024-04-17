@@ -50,15 +50,21 @@ class CRaidVolume
         int config_size = 1;// sector
         int degraded_disk = -1;
         struct DiskState {
-            int disk_index = -1;
+            int disk_index;
+            int m_status;
+            int degraded_disk;
+            DiskState(int i):disk_index(i),m_status(RAID_OK),degraded_disk(-1){}
         };
 
         static bool create(const TBlkDev& dev){
+            if(sizeof(TBlkDev) > SECTOR_SIZE){
+                return false;
+            }
+
             char* data = new char[SECTOR_SIZE];
             bool success = true;
             for(int i = 0; i < dev.m_Devices; i++){
-                DiskState state;
-                state.disk_index = i;
+                DiskState state(i);
                 memset(data, 0, SECTOR_SIZE);
                 memcpy(data, &state, sizeof(DiskState));
                 int ret = dev.m_Write(i, 0, data, 1);
@@ -68,30 +74,80 @@ class CRaidVolume
             return success;
         }
         int start(const TBlkDev& dev){
+            if(m_status != RAID_STOPPED){
+                return m_status;
+            }
             char* data = new char[SECTOR_SIZE];
             m_Dev = dev;
             bool success = true;
+
+            bool* read_success = new bool[m_Dev.m_Devices];
             for(int i = 0; i < m_Dev.m_Devices; i++){
-                if(dev.m_Read(i, 0, data, 1) != 1){
-                    m_status = RAID_FAILED;
-                    delete [] data;
-                    return m_status;
-                }
-                DiskState state;
+                read_success[i] = false;
+            }
+            int* degrade_info = new int[m_Dev.m_Devices];
+            int* raid_state = new int[m_Dev.m_Devices];
+
+            for(int i = 0; i < m_Dev.m_Devices; i++){
+                if(dev.m_Read(i, 0, data, 1) != 1) continue;
+                read_success[i] = true;
+                DiskState state(i);
                 memcpy(&state, data, sizeof(DiskState));
+                degrade_info[i] = state.degraded_disk;
+                raid_state[i] = state.m_status;
                 if(state.disk_index != i){
                     success = false;
                     break;
                 }
             }
+
             delete [] data;
-            m_status = success ? RAID_OK: RAID_FAILED;
+
+            for(int i = 0; i < m_Dev.m_Devices; i++){
+                if(!read_success[i]) continue;
+                if(degraded_disk == i || degrade_info[i] == i) continue;
+                degraded_disk = degrade_info[i];// can error here
+                m_status = raid_state[i]; // can error here
+            }
+
+            delete [] degrade_info;
+            delete [] raid_state;
+            delete [] read_success;
+
+            if(success == false){
+                m_status = RAID_FAILED;
+                return m_status;
+            }
+
+    
             return m_status;
         }
 
 
         int stop(){
-            m_status = RAID_STOPPED;
+            if(m_status == RAID_STOPPED){
+                return m_status;
+            }
+            
+            if(m_status == RAID_OK || m_status == RAID_DEGRADED){
+                char* data = new char[SECTOR_SIZE];
+                for(int i = 0; i < m_Dev.m_Devices;i++){
+                    if(m_status == RAID_DEGRADED && i == degraded_disk) continue;
+                    DiskState state(i);
+                    state.degraded_disk = degraded_disk;
+                    state.m_status = m_status;
+                    memset(data, 0, SECTOR_SIZE);
+                    memcpy(data, &state, sizeof(DiskState));
+                    int ret = m_Dev.m_Write(i, 0, data, 1);
+                    if(ret != 1){
+                        m_status = RAID_FAILED;
+                    }
+                }
+                delete [] data;
+            }
+            if(m_status != RAID_FAILED){
+                m_status = RAID_STOPPED;
+            }
             return m_status;
         }
 
@@ -99,49 +155,57 @@ class CRaidVolume
             if(m_status != RAID_DEGRADED){
                 return m_status;
             }
-            DiskState state;
+
+            DiskState state(degraded_disk);
             char* data = new char[SECTOR_SIZE];
-            state.disk_index = degraded_disk;
+            memset(data, 0, SECTOR_SIZE);
             memcpy(data, &state, sizeof(DiskState));
-            char** buffers = new char*[m_Dev.m_Devices];
-            for (int i = 0; i < m_Dev.m_Devices; i++) {
-                buffers[i] = new char[SECTOR_SIZE * m_Dev.m_Sectors-1];
+
+            int ret = m_Dev.m_Write(degraded_disk, 0, data, 1);
+            if(ret != 1){
+                m_status = RAID_DEGRADED;
+                return m_status;
             }
-            memset(buffers[degraded_disk], 0, SECTOR_SIZE * m_Dev.m_Sectors-1);
-            for(int j = 0; j < m_Dev.m_Devices; j++){
-                if(j == degraded_disk) continue;
-                int ret = m_Dev.m_Read(j, 1, buffers[j], m_Dev.m_Sectors-1);
-                if(ret != m_Dev.m_Sectors-1){
-                    m_status = RAID_FAILED;
-                    for( int d = 0; d < m_Dev.m_Devices; d++){
-                        delete [] buffers[d];
+
+
+            int granurity = 16;
+            char* buffer = new char[SECTOR_SIZE * granurity];
+            char* recover = new char[SECTOR_SIZE * granurity];
+            int sector_curr = config_size;
+            int size_of_drive = m_Dev.m_Sectors;
+            
+            while(sector_curr < size_of_drive){
+                if(size_of_drive - sector_curr < granurity){
+                    granurity = size_of_drive - sector_curr;
+                }
+
+                memset(recover, 0, SECTOR_SIZE * granurity);
+                for(int i = 0; i < m_Dev.m_Devices; i++){ 
+                    if(i == degraded_disk) continue;
+                    int ret = m_Dev.m_Read(i, sector_curr, buffer, granurity);
+                    if(ret != granurity){
+                        m_status = RAID_FAILED;
+                        delete [] buffer;
+                        delete [] recover;
+                        return m_status;
                     }
-                    delete [] buffers;
+                    for(int i = 0; i < granurity * SECTOR_SIZE; i++){
+                        recover[i] ^= buffer[i];
+                    }
+                }
+                int ret = m_Dev.m_Write(degraded_disk, sector_curr, recover, granurity);
+                if(ret != granurity){
+                    m_status = RAID_DEGRADED;
+                    delete [] buffer;
+                    delete [] recover;
                     return m_status;
                 }
+                sector_curr += granurity;
             }
 
-            for(int i = 0; i < m_Dev.m_Sectors-1; i++){
-                for(int j = 0; j < m_Dev.m_Devices; j++){
-                    if(j == degraded_disk) continue;
-                    for(int k = 0; k < SECTOR_SIZE; k++)
-                        buffers[degraded_disk][i*SECTOR_SIZE + k] ^= buffers[j][i*SECTOR_SIZE + k];
-                }
-            }
-
-            int ret = m_Dev.m_Write(degraded_disk, 1, buffers[degraded_disk] + SECTOR_SIZE, m_Dev.m_Sectors-1);
-            if(ret != m_Dev.m_Sectors-1){
-                m_status = RAID_DEGRADED;
-            } else {
-                degraded_disk = -1;
-                m_status = RAID_OK;
-            }
-
-            for(int d = 0; d < m_Dev.m_Devices; d++){
-                delete [] buffers[d];
-            }
-
-            delete [] buffers;
+            m_status = RAID_OK;
+            delete [] buffer;
+            delete [] recover;
             return m_status;
         }
 
@@ -483,6 +547,35 @@ void degradeDisk(int diskIndex, bool deleteFile = true)
         }
     }
 }
+
+void createandputDisk(int diskIndex){
+    char       buffer[SECTOR_SIZE];
+    memset    ( buffer, 0, sizeof ( buffer ) );
+
+    char       fn[100];
+    if (diskIndex < 0 || diskIndex >= RAID_DEVICES) {
+        throw std::runtime_error("Disk index out of range");
+    }
+
+    if (g_Fp[diskIndex] != nullptr) {
+        throw std::runtime_error("Disk already exist");
+    }
+
+    snprintf( fn, sizeof ( fn ), "/tmp/%04d", diskIndex );
+    g_Fp[diskIndex] = fopen(fn, "w+b");
+    if (!g_Fp[diskIndex]){
+        doneDisks();
+        throw std::runtime_error ( "Raw storage create error" );
+    }
+
+    for ( int j = 0; j < DISK_SECTORS; j ++ )
+    if ( fwrite ( buffer, sizeof ( buffer ), 1, g_Fp[diskIndex] ) != 1 )
+    {
+        doneDisks ();
+        throw std::runtime_error ( "Raw storage create error" );
+    }
+
+}
 //-------------------------------------------------------------------------------------------------
 void test0 (){
     printf("initialization and finalization test\n");
@@ -591,7 +684,7 @@ void test3 ()
     assert ( vol . start ( dev ) == RAID_OK );
     assert ( vol . status () == RAID_OK );
     for(int size = 2; size < 1000; size *= size ){
-        printf("%d\n", size);
+        // printf("%d\n", size);
         for( int i = 0; i < 200 - (size-1); i++){
             assert(vol.status() == RAID_OK);
             char buffer[SECTOR_SIZE*size];
@@ -742,6 +835,128 @@ void test5(){
     assert( vol . status () == RAID_STOPPED );
     doneDisks ();
 }
+
+
+void  test_resync ()
+{
+    printf("est_resync \n");
+    TBlkDev  dev = createDisks ();
+    assert ( CRaidVolume::create ( dev ) );
+    CRaidVolume vol;
+    assert ( vol . start ( dev ) == RAID_OK );
+    assert ( vol . status () == RAID_OK );
+    int size = 1;
+    for( int i = 0; i < 20; i++, size *=size){
+        assert(vol.status() == RAID_OK);
+        char buffer[SECTOR_SIZE*size];
+        char buffer2[SECTOR_SIZE*size];
+        char reference_buffer[SECTOR_SIZE*size];
+        char reference_buffer2[SECTOR_SIZE*size];
+
+        for (int j = 0; j < SECTOR_SIZE*size; j++) {
+            buffer[j] = rand() % 256;
+            buffer2[j] = rand() % 256;
+        }
+        memcpy(reference_buffer, buffer, SECTOR_SIZE*size);
+        memcpy(reference_buffer2, buffer2, SECTOR_SIZE*size);
+
+        assert(vol.write( i, buffer, size));
+        assert(vol.status() == RAID_OK);
+    
+        assert(vol.write(i+size, buffer2, size));
+        assert(vol.status() == RAID_OK);
+
+        
+        degradeDisk(2);
+        memset(buffer, 0, SECTOR_SIZE*size);
+        assert(vol.read( i, buffer, size));
+        assert(vol.status() == RAID_DEGRADED);
+
+        memset(buffer2, 0, SECTOR_SIZE*size);
+        assert(vol.read(i+size, buffer2, size));
+        assert(vol.status() == RAID_DEGRADED);
+
+
+        assert(memcmp(buffer, reference_buffer, SECTOR_SIZE*size) == 0);
+        assert(memcmp(buffer2, reference_buffer2, SECTOR_SIZE*size) == 0);
+
+        createandputDisk(2);
+        int ret = vol.resync();
+        // printf("%d\n", ret);
+        assert(ret == RAID_OK);
+
+        memset(buffer, 0, SECTOR_SIZE*size);
+        assert(vol.read( i, buffer, size));
+        assert(vol.status() == RAID_OK);
+        memset(buffer2, 0, SECTOR_SIZE*size);
+        assert(vol.read(i+size, buffer2, size));
+        assert(vol.status() == RAID_OK);
+
+
+        assert(memcmp(buffer, reference_buffer, SECTOR_SIZE*size) == 0);
+        assert(memcmp(buffer2, reference_buffer2, SECTOR_SIZE*size) == 0);
+
+    }
+    assert ( vol . stop () == RAID_STOPPED );
+    assert ( vol . status () == RAID_STOPPED );
+    doneDisks ();
+}
+
+
+void  test_resync_whole ()
+{
+    printf("test_resync_whole \n");
+    TBlkDev  dev = createDisks ();
+    assert ( CRaidVolume::create ( dev ) );
+    CRaidVolume vol;
+    assert ( vol . start ( dev ) == RAID_OK );
+    assert ( vol . status () == RAID_OK );
+    int size = 100;
+    // printf("%d\n", size);
+
+    assert(vol.status() == RAID_OK);
+    char buffer[SECTOR_SIZE*size];
+    char reference_buffer[SECTOR_SIZE*size];
+   
+
+    for (int j = 0; j < SECTOR_SIZE*size; j++) {
+        buffer[j] = rand() % 256;
+    }
+    memcpy(reference_buffer, buffer, SECTOR_SIZE*size);
+
+    assert(vol.write( vol.size()-size, buffer, size));
+    assert(vol.status() == RAID_OK);
+
+    memset(buffer, 0, SECTOR_SIZE*size);
+
+    degradeDisk(3);
+    assert(vol.read(vol.size()-size, buffer, size));
+    assert(vol.status() == RAID_DEGRADED);
+   
+
+    assert(memcmp(buffer, reference_buffer, SECTOR_SIZE*size) == 0);
+
+    createandputDisk(3);
+
+    int ret = vol.resync();
+    // printf("%d\n", ret);
+
+    assert(ret == RAID_OK);
+    memset(buffer, 0, SECTOR_SIZE*size);
+
+    assert(vol.read(vol.size()-size, buffer, size));
+    assert(vol.status() == RAID_OK);
+
+    assert(memcmp(buffer, reference_buffer, SECTOR_SIZE*size) == 0);
+
+    assert ( vol . stop () == RAID_STOPPED );
+    assert ( vol . status () == RAID_STOPPED );
+    doneDisks ();
+}
+
+
+
+
 //-------------------------------------------------------------------------------------------------
 void                                   test20                                  ()
 {
@@ -771,11 +986,13 @@ int                                    main                                    (
     test_read();
     test_read_error();
     test1 ();
-    // test2 ();
+    test2 ();
     test_multi_write();
     test3();
     test4();
     test5();
+    test_resync();
+    test_resync_whole();
     return EXIT_SUCCESS;
 }
 
