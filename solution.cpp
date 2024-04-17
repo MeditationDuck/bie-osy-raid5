@@ -50,10 +50,11 @@ class CRaidVolume
         int config_size = 1;// sector
         int degraded_disk = -1;
         struct DiskState {
+            int touched;
             int disk_index;
             int m_status;
             int degraded_disk;
-            DiskState(int i):disk_index(i),m_status(RAID_OK),degraded_disk(-1){}
+            DiskState(int i):touched(-1),disk_index(i),m_status(RAID_OK),degraded_disk(-1){}
         };
 
         static bool create(const TBlkDev& dev){
@@ -79,8 +80,7 @@ class CRaidVolume
             }
             char* data = new char[SECTOR_SIZE];
             m_Dev = dev;
-            bool success = true;
-
+            int count = 0;
             bool* read_success = new bool[m_Dev.m_Devices];
             for(int i = 0; i < m_Dev.m_Devices; i++){
                 read_success[i] = false;
@@ -90,15 +90,14 @@ class CRaidVolume
 
             for(int i = 0; i < m_Dev.m_Devices; i++){
                 if(dev.m_Read(i, 0, data, 1) != 1) continue;
-                read_success[i] = true;
+                
                 DiskState state(i);
                 memcpy(&state, data, sizeof(DiskState));
+                if(state.touched != -1) continue;
+                count++;
+                read_success[i] = true;
                 degrade_info[i] = state.degraded_disk;
                 raid_state[i] = state.m_status;
-                if(state.disk_index != i){
-                    success = false;
-                    break;
-                }
             }
 
             delete [] data;
@@ -114,12 +113,9 @@ class CRaidVolume
             delete [] raid_state;
             delete [] read_success;
 
-            if(success == false){
+            if(count < m_Dev.m_Devices-1){
                 m_status = RAID_FAILED;
-                return m_status;
             }
-
-    
             return m_status;
         }
 
@@ -145,9 +141,20 @@ class CRaidVolume
                 }
                 delete [] data;
             }
-            if(m_status != RAID_FAILED){
-                m_status = RAID_STOPPED;
+
+            if(m_status == RAID_FAILED){
+                char* data = new char[SECTOR_SIZE];
+                for(int i = 0; i < m_Dev.m_Devices;i++){
+                    DiskState state(i);
+                    state.m_status = RAID_FAILED;
+                    memset(data, 0, SECTOR_SIZE);
+                    memcpy(data, &state, sizeof(DiskState));
+                    m_Dev.m_Write(i, 0, data, 1);
+                }
+                delete [] data;
             }
+
+            m_status = RAID_STOPPED;
             return m_status;
         }
 
@@ -254,9 +261,19 @@ class CRaidVolume
             for(int j = 0; j < m_Dev.m_Devices; j++){
                 int ret = m_Dev.m_Read(j, startingSector, buffers[j], row_size);
                 if(ret != row_size){
-                    // printf("degrade reading %d\n", j);
-                    m_status = RAID_DEGRADED;
-                    degraded_disk = j;
+                    if(m_status == RAID_DEGRADED){
+                        if(degraded_disk != j){
+                            m_status = RAID_FAILED;
+                            for(int d = 0; d < m_Dev.m_Devices; d++){
+                                delete[] buffers[d];
+                            }
+                            delete[] buffers;
+                            return false;
+                        }
+                    }else if(m_status == RAID_OK){
+                        m_status = RAID_DEGRADED;
+                        degraded_disk = j;
+                    }
                 }
             }
 
@@ -361,7 +378,6 @@ class CRaidVolume
                 }
                 delete [] parity_xor;
             }
-            // fixed data
 
             const char* dataPtr = static_cast<const char*>(data);
             for(int i = 0; i < row_size; i++){
@@ -387,7 +403,6 @@ class CRaidVolume
                 int ret = m_Dev.m_Write(i, startingSector, buffers[i], row_size);
                 if(ret != row_size){
                     if(m_status == RAID_DEGRADED){
-                        // printf("write: write fail, at : %d\n", i);
                         if(degraded_disk != i){
                             m_status = RAID_FAILED;
                         }
@@ -401,7 +416,7 @@ class CRaidVolume
                 delete[] buffers[i];
             }
             delete[] buffers;
-            if(m_status== RAID_FAILED){
+            if(m_status == RAID_FAILED){
                 return false;
             }
             return true;
@@ -955,6 +970,63 @@ void  test_resync_whole ()
 }
 
 
+void  test_offline_replace()
+{
+    printf("test_offline_replace \n");
+    TBlkDev  dev = createDisks ();
+    assert ( CRaidVolume::create ( dev ) );
+    CRaidVolume vol;
+    assert ( vol . start ( dev ) == RAID_OK );
+    assert ( vol . status () == RAID_OK );
+    int size = 100;
+    // printf("%d\n", size);
+
+    assert(vol.status() == RAID_OK);
+    char buffer[SECTOR_SIZE*size];
+    char reference_buffer[SECTOR_SIZE*size];
+   
+
+    for (int j = 0; j < SECTOR_SIZE*size; j++) {
+        buffer[j] = rand() % 256;
+    }
+    memcpy(reference_buffer, buffer, SECTOR_SIZE*size);
+
+    assert(vol.write( vol.size()-size, buffer, size));
+    assert(vol.status() == RAID_OK);
+
+    memset(buffer, 0, SECTOR_SIZE*size);
+
+    degradeDisk(3);
+    assert(vol.read(vol.size()-size, buffer, size));
+    assert(vol.status() == RAID_DEGRADED);
+    assert(memcmp(buffer, reference_buffer, SECTOR_SIZE*size) == 0);
+
+    assert ( vol . stop () == RAID_STOPPED );
+    assert ( vol . status () == RAID_STOPPED );
+
+    CRaidVolume vol2;
+
+    assert ( vol2 . start ( dev ) == RAID_DEGRADED);
+    assert ( vol2 . status () == RAID_DEGRADED);
+
+    createandputDisk(3);
+
+    int ret = vol2.resync();
+    printf("%d\n", ret);
+
+    assert(ret == RAID_OK);
+    memset(buffer, 0, SECTOR_SIZE*size);
+
+    assert(vol2.read(vol2.size()-size, buffer, size));
+    assert(vol2.status() == RAID_OK);
+
+    assert(memcmp(buffer, reference_buffer, SECTOR_SIZE*size) == 0);
+
+    assert ( vol2. stop () == RAID_STOPPED );
+    assert ( vol2 . status () == RAID_STOPPED );
+    doneDisks ();
+}
+
 
 
 //-------------------------------------------------------------------------------------------------
@@ -993,6 +1065,7 @@ int                                    main                                    (
     test5();
     test_resync();
     test_resync_whole();
+    test_offline_replace();
     return EXIT_SUCCESS;
 }
 
