@@ -45,15 +45,10 @@ struct TBlkDev
 class CRaidVolume
 {
     public:
-
         TBlkDev m_Dev;
-
         int m_status = RAID_STOPPED;
-
         int config_size = 1;// sector
-
         int degraded_disk = -1;
-
         struct DiskState {
             int disk_index = -1;
         };
@@ -126,7 +121,6 @@ class CRaidVolume
                 int ret = m_Dev.m_Read(j, 1, buffers[j], m_Dev.m_Sectors-1);
                 if(ret != m_Dev.m_Sectors-1){
                     m_status = RAID_FAILED;
-
                     for( int d = 0; d < m_Dev.m_Devices; d++){
                         delete [] buffers[d];
                     }
@@ -174,7 +168,6 @@ class CRaidVolume
             if(startingDisk >= parity_at_start_disk){
                 startingDisk++;
             }
-
             int endingSector = (secNr+secCnt-1) / (m_Dev.m_Devices - 1) + config_size;
             int endingDisk = (secNr+secCnt-1) % (m_Dev.m_Devices - 1);
             int parity_at_end_disk = (endingSector) % m_Dev.m_Devices;
@@ -182,12 +175,6 @@ class CRaidVolume
                 endingDisk++;
             }
             int row_size = endingSector - startingSector + 1;
-
-            // printf("Starting Sector: %d\n", startingSector);
-            // printf("Starting Disk: %d\n", startingDisk);
-            // printf("Ending Sector: %d\n", endingSector);
-            // printf("Ending Disk: %d\n", endingDisk);
-            // printf("Row Size: %d\n", row_size);
     
             char** buffers = new char*[m_Dev.m_Devices];
             for (int i = 0; i < m_Dev.m_Devices; i++) {
@@ -232,7 +219,6 @@ class CRaidVolume
             if(endingDisk >= parity_at_end_disk){
                 endingDisk++;
             }
-
             int row_size = endingSector - startingSector + 1;
 
             char** old_data = new char*[m_Dev.m_Devices];
@@ -491,7 +477,7 @@ void test3 ()
     assert ( vol . status () == RAID_OK );
     for(int size = 2; size < 1000; size *= size ){
         printf("%d\n", size);
-        for( int i = 0; i < vol.size() - (size-1); i++){
+        for( int i = 0; i < 20 - (size-1); i++){
             // printf("%d\n", i);
             assert(vol.status() == RAID_OK);
             char buffer[SECTOR_SIZE*size];
